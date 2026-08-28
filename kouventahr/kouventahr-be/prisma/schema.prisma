@@ -1,0 +1,57 @@
+generator client {
+  provider        = "prisma-client"
+  previewFeatures = ["postgresqlExtensions"]
+  output          = "./generated/client" 
+}
+
+datasource db {
+  provider   = "postgresql"
+  extensions = [vector]
+}
+
+// ==========================================
+// 1. THE KNOWLEDGE BASE (Unstructured Data)
+// ==========================================
+
+model Document {
+  id        String          @id @default(uuid())
+  filename  String          // e.g., "Employee_Handbook_2026.pdf"
+  createdAt DateTime        @default(now())
+  
+  // A document is split into many chunks
+  chunks    DocumentChunk[] 
+}
+
+model DocumentChunk {
+  id         String   @id @default(uuid())
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  
+  // The actual paragraph/text segment
+  content    String   @db.Text
+  
+  // The 768-dimension vector for nomic-embed-text
+  embedding  Unsupported("vector(768)")? 
+}
+
+// ==========================================
+// 2. THE CHAT MEMORY (Context)
+// ==========================================
+
+model ChatSession {
+  id        String        @id @default(uuid())
+  messages  ChatMessage[]
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+}
+
+model ChatMessage {
+  id        String      @id @default(uuid())
+  sessionId String
+  session   ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  
+  role      String      // 'user' or 'assistant'
+  content   String      @db.Text
+  
+  createdAt DateTime    @default(now())
+}
