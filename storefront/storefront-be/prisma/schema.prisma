@@ -1,0 +1,61 @@
+generator client {
+  provider        = "prisma-client"
+  previewFeatures = ["postgresqlExtensions"]
+  output          = "./generated/client"
+  moduleFormat    = "cjs"
+}
+
+datasource db {
+  provider   = "postgresql"
+  extensions = [vector]
+}
+
+// ==========================================
+// 1. THE KNOWLEDGE BASE (RAG Target)
+// ==========================================
+
+model Product {
+  id          String   @id @default(uuid())
+  name        String
+  description String   @db.Text
+  price       Decimal  @db.Decimal(10, 2)
+  category    String?
+  inStock     Boolean  @default(true)
+
+  // for open source model vector embedding 
+  embedding   Unsupported("vector(768)")?
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// ==========================================
+// 2. THE CHAT MEMORY (Context)
+// ==========================================
+
+model ChatSession {
+  id        String        @id @default(uuid())
+  // Optional: Link to a User ID if they are logged in, otherwise keep null for guest checkouts
+  userId    String?       
+  messages  ChatMessage[]
+  
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+}
+
+model ChatMessage {
+  id        String      @id @default(uuid())
+  sessionId String
+  session   ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  
+  role      Role        
+  content   String      @db.Text
+  
+  createdAt DateTime    @default(now())
+}
+
+enum Role {
+  USER
+  AI
+  SYSTEM
+}

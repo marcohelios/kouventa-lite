@@ -1,0 +1,72 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: storefront-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: storefront
+    ports:
+      - "5432:5432"
+    volumes:
+      - storefront_pgdata:/var/lib/postgresql/data
+    networks:
+      - storefront-net
+
+  go-backend:
+    build:
+      context: ./storefront-go
+      dockerfile: Dockerfile
+    container_name: storefront-go
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://admin:password@postgres:5432/storefront
+      OLLAMA_URL: http://host.docker.internal:11434
+    ports:
+      - "3001:3001"
+    depends_on:
+      - postgres
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - storefront-net
+
+  fastify-backend:
+    build:
+      context: ./storefront-be
+      dockerfile: Dockerfile
+    container_name: storefront-fastify
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://admin:password@postgres:5432/storefront?schema=public
+      OLLAMA_HOST: http://host.docker.internal:11434
+    ports:
+      - "3002:3002"
+    depends_on:
+      - postgres
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - storefront-net
+
+  ui:
+    build:
+      context: ./storefront-ui
+      dockerfile: Dockerfile
+    container_name: storefront-ui
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - go-backend
+      - fastify-backend
+    networks:
+      - storefront-net
+
+volumes:
+  storefront_pgdata:
+
+networks:
+  storefront-net:
+    driver: bridge
