@@ -1,11 +1,11 @@
-import express, { Request, Response } from 'express';
-import cors from 'cors';
-import multer from 'multer';
+import Fastify, { FastifyRequest, FastifyReply } from 'fastify';
+import cors from '@fastify/cors';
+import multipart from '@fastify/multipart';
 import { PrismaClient } from './prisma/generated/client/client'; // Adjust path if needed
 import { PrismaPg } from '@prisma/adapter-pg';
 import { Pool } from 'pg';
 import 'dotenv/config'; // Force dotenv to load your DATABASE_URL
-import ollama from 'ollama';
+import { Ollama } from 'ollama';
 import { PDFParse } from 'pdf-parse';
 
 // 1. Explicitly create the Postgres connection pool
@@ -17,17 +17,19 @@ const adapter = new PrismaPg(pool);
 // 3. Initialize Prisma using the configured adapter
 const prisma = new PrismaClient({ adapter });
 
-// Initialize Express and Middleware
-const app = express();
-app.use(cors());
-app.use(express.json());
+// Initialize Fastify and plugins
+const app = Fastify({ logger: true });
+
+const ollama = new Ollama({
+  host: process.env.OLLAMA_HOST,
+});
 
 // --- HELPER FUNCTION ---
 // Splits text into chunks of ~500 words with a 50-word overlap
 function chunkText(text: string, chunkSize: number = 500, overlap: number = 50): string[] {
   const words = text.split(/\s+/);
   const chunks: string[] = [];
-  
+
   for (let i = 0; i < words.length; i += (chunkSize - overlap)) {
     const chunk = words.slice(i, i + chunkSize).join(' ');
     if (chunk.trim().length > 0) {
@@ -44,70 +46,89 @@ interface ChunkResult {
   content: string;
 }
 
-// --- PDF UPLOAD ENDPOINT ---
-// Configure multer to hold the uploaded file in RAM
-const upload = multer({ storage: multer.memoryStorage() });
+interface ChatBody {
+  message: string;
+  sessionId?: string;
+  documentId?: string;
+}
 
-app.post('/api/upload', upload.single('file'), async (req: Request, res: Response): Promise<any> => {
+async function registerPlugins() {
+  await app.register(cors, {});
+  // @fastify/multipart replaces multer. Default limits are generous;
+  // tighten fileSize if you want to cap upload size explicitly.
+  await app.register(multipart);
+}
+
+// --- PDF UPLOAD ENDPOINT ---
+app.post('/api/upload', async (request: FastifyRequest, reply: FastifyReply) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
+    // request.file() throws if the request body isn't multipart/form-data
+    // at all (e.g. no file attached), rather than returning undefined.
+    // Check isMultipart() first so that case cleanly returns 400 instead
+    // of falling into the catch block below as a 500.
+    if (!request.isMultipart()) {
+      return reply.status(400).send({ error: 'No file uploaded' });
     }
 
-    const fileBuffer = req.file.buffer;
-    const filename = req.file.originalname;
+    const data = await request.file();
+
+    if (!data) {
+      return reply.status(400).send({ error: 'No file uploaded' });
+    }
+
+    const fileBuffer = await data.toBuffer();
+    const filename = data.filename;
 
     const parser = new PDFParse({ data: fileBuffer });
     const result = await parser.getText();
     const rawText = result.text;
 
-    // 2. Split the text into overlapping chunks
+    // Split the text into overlapping chunks
     const chunks = chunkText(rawText);
 
-    // 3. Create the parent Document record in the database
+    // Create the parent Document record in the database
     const document = await prisma.document.create({
-      data: { filename: filename }
+      data: { filename: filename },
     });
 
-    // 4. Generate embeddings and save each chunk
+    // Generate embeddings and save each chunk
     let chunksProcessed = 0;
-    for (const chunkText of chunks) {
+    for (const chunk of chunks) {
       const embedResponse = await ollama.embeddings({
         model: 'nomic-embed-text',
-        prompt: chunkText,
+        prompt: chunk,
       });
-      
+
       const vectorString = `[${embedResponse.embedding.join(',')}]`;
 
       await prisma.$executeRaw`
         INSERT INTO "DocumentChunk" (
           "id", "documentId", "content", "embedding"
         ) VALUES (
-          gen_random_uuid(), 
-          ${document.id}, 
-          ${chunkText}, 
+          gen_random_uuid(),
+          ${document.id},
+          ${chunk},
           ${vectorString}::vector
         )
       `;
       chunksProcessed++;
     }
 
-    return res.status(200).json({ 
-      success: true, 
+    return reply.status(200).send({
+      success: true,
       message: `Successfully processed ${filename}`,
-      chunksCreated: chunksProcessed
+      chunksCreated: chunksProcessed,
     });
-
   } catch (error) {
-    console.error('Error processing PDF:', error);
-    return res.status(500).json({ error: 'Failed to process document' });
+    app.log.error(error, 'Error processing PDF');
+    return reply.status(500).send({ error: 'Failed to process document' });
   }
 });
 
 // ==========================================
 // 1. LIST UPLOADED DOCUMENTS
 // ==========================================
-app.get('/api/documents', async (req: Request, res: Response): Promise<any> => {
+app.get('/api/documents', async (request: FastifyRequest, reply: FastifyReply) => {
   try {
     const documents = await prisma.document.findMany({
       orderBy: { createdAt: 'desc' },
@@ -125,22 +146,22 @@ app.get('/api/documents', async (req: Request, res: Response): Promise<any> => {
       createdAt: doc.createdAt,
     }));
 
-    return res.status(200).json(formattedDocs);
+    return reply.status(200).send(formattedDocs);
   } catch (error) {
-    console.error('Error fetching documents:', error);
-    return res.status(500).json({ error: 'Failed to fetch documents' });
+    app.log.error(error, 'Error fetching documents');
+    return reply.status(500).send({ error: 'Failed to fetch documents' });
   }
 });
 
 // ==========================================
 // 2. DOCUMENT RAG CHAT (STREAMING)
 // ==========================================
-app.post('/api/chat', async (req: Request, res: Response): Promise<any> => {
+app.post('/api/chat', async (request: FastifyRequest<{ Body: ChatBody }>, reply: FastifyReply) => {
   try {
-    const { message, sessionId, documentId } = req.body;
+    const { message, sessionId, documentId } = request.body;
 
     if (!message) {
-      return res.status(400).json({ error: 'Message is required' });
+      return reply.status(400).send({ error: 'Message is required' });
     }
 
     // 1. Generate embedding for user question
@@ -159,12 +180,14 @@ app.post('/api/chat', async (req: Request, res: Response): Promise<any> => {
           JOIN "Document" d ON dc."documentId" = d.id
           WHERE dc."documentId" = ${documentId}
           ORDER BY dc.embedding <=> ${vectorString}::vector
+          LIMIT 5
         `
       : await prisma.$queryRaw<ChunkResult[]>`
           SELECT dc.id, dc."documentId", d.filename, dc.content
           FROM "DocumentChunk" dc
           JOIN "Document" d ON dc."documentId" = d.id
           ORDER BY dc.embedding <=> ${vectorString}::vector
+          LIMIT 5
         `;
 
     // 3. Manage Chat Session & History
@@ -193,8 +216,8 @@ app.post('/api/chat', async (req: Request, res: Response): Promise<any> => {
       .map((c, i) => `[Excerpt ${i + 1} from "${c.filename}"]:\n${c.content}`)
       .join('\n\n---\n\n');
 
-    const systemPrompt = `You are an internal knowledge assistant. Answer the user's question based strictly on the provided document source.
-If the source do not contain the answer, explicitly state that the information is not present in the uploaded documents. Do not speculate or hallucinate.
+    const systemPrompt = `You are an internal knowledge assistant. Answer the user's question based on the retrieved sources.
+If the source do not contain the answer, Tell me user that you do not have information about that topic. Do not speculate or hallucinate.
 
 Document Context:
 ${contextString || 'No matching document context found.'}`;
@@ -205,10 +228,22 @@ ${contextString || 'No matching document context found.'}`;
       { role: 'user', content: message },
     ];
 
-    // 5. Initialize Server-Sent Events (SSE)
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
+    // 5. Take over the raw response for Server-Sent Events (SSE).
+    // reply.hijack() tells Fastify "I'm handling this response myself" —
+    // without it, Fastify will try to serialize/send its own response
+    // on top of what we write manually below.
+    reply.hijack();
+
+    // Carry over headers Fastify has collected so far (this includes CORS)
+    for (const [key, value] of Object.entries(reply.getHeaders())) {
+      if (value !== undefined) reply.raw.setHeader(key, value);
+    }
+
+    reply.raw.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    });
 
     // Send metadata (session ID and source document citations)
     const sources = relevantChunks.map((c) => ({
@@ -216,7 +251,7 @@ ${contextString || 'No matching document context found.'}`;
       filename: c.filename,
     }));
 
-    res.write(
+    reply.raw.write(
       `data: ${JSON.stringify({
         type: 'meta',
         sessionId: currentSessionId,
@@ -235,7 +270,7 @@ ${contextString || 'No matching document context found.'}`;
     for await (const chunk of stream) {
       const text = chunk.message.content;
       fullAiResponse += text;
-      res.write(`data: ${JSON.stringify({ type: 'chunk', content: text })}\n\n`);
+      reply.raw.write(`data: ${JSON.stringify({ type: 'chunk', content: text })}\n\n`);
     }
 
     // 7. Save conversation to database
@@ -246,41 +281,45 @@ ${contextString || 'No matching document context found.'}`;
       ],
     });
 
-    res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
-    return res.end();
+    reply.raw.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
+    return reply.raw.end();
   } catch (error) {
-    console.error('Error in RAG chat endpoint:', error);
-    if (!res.headersSent) {
-      return res.status(500).json({ error: 'Internal server error' });
+    app.log.error(error, 'Error in RAG chat endpoint');
+    if (!reply.raw.headersSent) {
+      return reply.status(500).send({ error: 'Internal server error' });
     }
-    res.write(`data: ${JSON.stringify({ type: 'error', content: 'Inference failed.' })}\n\n`);
-    return res.end();
+    reply.raw.write(`data: ${JSON.stringify({ type: 'error', content: 'Inference failed.' })}\n\n`);
+    return reply.raw.end();
   }
 });
 
-app.delete('/api/documents/:id', async (req: Request, res: Response): Promise<any> => {
+app.delete('/api/documents/:id', async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
   try {
-    const documentId = req.params.id as string;
+    const documentId = request.params.id;
 
     // The 'onDelete: Cascade' in schema.prisma ensures all associated chunks are also deleted
     await prisma.document.delete({
       where: { id: documentId },
     });
 
-    return res.status(200).json({ success: true, message: 'Document and associated vectors deleted.' });
+    return reply.status(200).send({ success: true, message: 'Document and associated vectors deleted.' });
   } catch (error) {
-    console.error('Error deleting document:', error);
-    return res.status(500).json({ error: 'Failed to delete document' });
+    app.log.error(error, 'Error deleting document');
+    return reply.status(500).send({ error: 'Failed to delete document' });
   }
 });
 
 // --- START SERVER ---
 const startServer = async () => {
   try {
-    const address = await app.listen({ port: 3002, host: '0.0.0.0' });
+    await registerPlugins();
+    // Fastify's listen() is a real Promise that resolves to the address
+    // string — unlike Express's listen(), which returns the Server
+    // instance and made the old log line print "[object Object]".
+    const address = await app.listen({ port: 3001, host: '0.0.0.0' });
     console.log(`Server listening at ${address}`);
   } catch (err) {
-    console.error(err);
+    app.log.error(err);
     process.exit(1);
   }
 };

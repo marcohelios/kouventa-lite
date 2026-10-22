@@ -1,0 +1,17 @@
+{
+  "status": 200,
+  "body": [
+    {
+      "id": "68551eef-f5a1-417e-876c-4484e268bf06",
+      "filename": "kouventa onboarding 2.pdf",
+      "chunkCount": 1,
+      "createdAt": "2026-08-19T08:56:03.556Z"
+    },
+    {
+      "id": "989cbc6b-742f-4ca4-b59d-13a9d422f273",
+      "filename": "Kouventa Onboarding 1.pdf",
+      "chunkCount": 2,
+      "createdAt": "2026-08-19T08:54:25.232Z"
+    }
+  ]
+}

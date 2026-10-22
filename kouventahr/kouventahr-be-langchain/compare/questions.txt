@@ -1,0 +1,4 @@
+# Questions for: npm run compare -- --file compare/questions.txt
+# One question per line. Lines starting with # are ignored.
+# Each run writes a markdown report to compare/results/.
+

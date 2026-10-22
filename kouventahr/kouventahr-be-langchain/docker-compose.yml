@@ -1,0 +1,96 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: kouventahr-lc-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: kouventahr_lc
+    ports:
+      - "5433:5432"
+    volumes:
+      - kouventahr_lc_pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d kouventahr_lc"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: kouventahr-lc-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - kouventahr_lc_ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+
+  # One-shot job: pulls the embedding + chat models into the ollama volume.
+  ollama-pull:
+    image: ollama/ollama:latest
+    container_name: kouventahr-lc-ollama-pull
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - ollama pull ${EMBED_MODEL:-nomic-embed-text} && ollama pull ${CHAT_MODEL:-llama3.1:8b}
+    restart: "no"
+
+  # Knowledge graph for the GraphRAG comparison (src/graphrag/). Not used by the app.
+  # Browser UI: http://localhost:7474 (neo4j / password123)
+  neo4j:
+    image: neo4j:5.26-community
+    container_name: kouventahr-lc-neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/password123
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - kouventahr_lc_neo4j:/data
+
+  app:
+    build: .
+    container_name: kouventahr-lc-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama-pull:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql://admin:password@postgres:5432/kouventahr_lc
+      OLLAMA_HOST: http://ollama:11434
+      EMBED_MODEL: ${EMBED_MODEL:-nomic-embed-text}
+      CHAT_MODEL: ${CHAT_MODEL:-llama3.1:8b}
+      RETRIEVER_K: ${RETRIEVER_K:-5}
+      CHUNK_SIZE: ${CHUNK_SIZE:-2000}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-200}
+    ports:
+      - "3001:3001"
+
+volumes:
+  kouventahr_lc_pgdata:
+  kouventahr_lc_ollama:
+  kouventahr_lc_neo4j:

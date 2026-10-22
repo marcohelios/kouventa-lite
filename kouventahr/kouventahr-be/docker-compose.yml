@@ -8,9 +8,39 @@ services:
       POSTGRES_PASSWORD: password
       POSTGRES_DB: kouventahr
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - kouventahr_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d kouventahr"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: kouventahr-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - kouventahr_ollama:/root/.ollama
+
+  app:
+    build: .
+    container_name: kouventahr-be-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql://admin:password@postgres:5432/kouventahr
+      OLLAMA_HOST: http://ollama:11434
+    ports:
+      - "3001:3001"
 
 volumes:
   kouventahr_pgdata:
+  kouventahr_ollama:
