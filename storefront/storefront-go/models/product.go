@@ -27,3 +27,20 @@ type ProductRequest struct {
 	Price       float64 `json:"price"`
 	Category    string  `json:"category"`
 }
+
+type UserRole string
+
+const (
+	RoleNormal  UserRole = "NORMAL"
+	RolePremium UserRole = "PREMIUM"
+)
+
+type User struct {
+	ID           string    `gorm:"column:id;primaryKey"`
+	Email        string    `gorm:"column:email;unique"`
+	PasswordHash string    `gorm:"column:password_hash"`
+	Role         UserRole  `gorm:"column:role"`
+	CreatedAt    time.Time `gorm:"column:created_at"`
+}
+
+func (User) TableName() string { return "users" }

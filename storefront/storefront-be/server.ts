@@ -1,25 +1,55 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
+import cookie from '@fastify/cookie';
+import jwt from '@fastify/jwt';
+import { FastifyRequest, FastifyReply } from 'fastify';
+import '@fastify/jwt'; // type augmentation
 import { PrismaClient } from './prisma/generated/client/client';
 import { Pool } from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg';
 import 'dotenv/config';
 import ollama from 'ollama';
-
+import { authRoutes } from './src/routes/auth';
+import { unwrapKey, decryptValue, encryptValue } from "./src/utils/crypto";
 // ==========================================
 // 1. DATABASE & SERVER INITIALIZATION
 // ==========================================
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const adapter = new PrismaPg(pool);
-const prisma = new PrismaClient({ adapter });
+export const prisma = new PrismaClient({ adapter });
 
 const fastify = Fastify({ logger: true });
 
 fastify.register(cors, {
-  origin: 'http://localhost:3000',
+  origin: /^http:\/\/localhost:\d+$/,
   methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
 });
+
+fastify.register(cookie);
+fastify.register(jwt, {
+  secret: process.env.JWT_SECRET!,
+  cookie: { cookieName: 'token', signed: false },
+});
+fastify.decorate('authenticate', async (request: FastifyRequest, reply: FastifyReply) => {
+  try {
+    await request.jwtVerify();
+  } catch {
+    reply.code(401).send({ error: 'Unauthorized' });
+  }
+});
+
+function requireRole(role: "NORMAL" | "PREMIUM") {
+  return async (request: FastifyRequest, reply: FastifyReply) => {
+    const user = request.user as { role?: string };
+    if (user?.role !== role) {
+      reply.code(403).send({ error: "Forbidden" });
+    }
+  };
+}
+
+fastify.register(authRoutes);
 
 // Helper Interface for Raw Queries
 interface ProductResult {
@@ -33,7 +63,9 @@ interface ProductResult {
 // ==========================================
 // 2. GET: FETCH ALL PRODUCTS
 // ==========================================
-fastify.get('/api/products', async (request, reply) => {
+fastify.get('/api/products',
+  // { preHandler: [fastify.authenticate] },
+  async (request, reply) => {
   try {
     const products = await prisma.product.findMany({
       select: { id: true, name: true, description: true, price: true, category: true },
@@ -87,18 +119,19 @@ fastify.post('/api/products', async (request, reply) => {
 // 4. DELETE: REMOVE PRODUCT BY ID
 // ==========================================
 fastify.delete('/api/products/:id', async (request, reply) => {
-  try {
-    const { id } = request.params as { id: string };
-    
-    await prisma.product.delete({
-      where: { id: id },
-    });
-    
-    return { success: true, message: `Deleted product ID: ${id}` };
-  } catch (error) {
-    request.log.error(error);
-    return reply.status(500).send({ error: 'Failed to delete product' });
+  const authHeader = request.headers.authorization;
+  if (!authHeader?.startsWith("Bearer ")) {
+    return reply.status(400).send({ error: "Missing encryption key" });
   }
+
+  const aesKey = await unwrapKey(authHeader.slice(7));
+  const { id: encryptedId } = request.params as { id: string };
+  const productId = decryptValue(aesKey, decodeURIComponent(encryptedId));
+
+  await prisma.product.delete({ where: { id: productId } });
+
+  const responseBody = JSON.stringify({ success: true, message: `Deleted product ${productId}` });
+  return reply.type("text/plain").send(encryptValue(aesKey, responseBody));
 });
 
 // ==========================================
@@ -152,6 +185,7 @@ fastify.post('/api/chat', async (request, reply) => {
       SELECT id, name, description, price, category
       FROM "Product"
       ORDER BY embedding <=> ${vectorString}::vector
+      LIMIT 5
     `;
 
     // 3. Build Context String
@@ -167,6 +201,11 @@ ${contextString || 'No matching products found.'}`;
 
     // 4. Set headers for SSE on Fastify's raw response object
     reply.raw.setHeader('Access-Control-Allow-Origin', 'http://localhost:3000');
+    const origin = request.headers.origin;
+    if (origin && /^http:\/\/localhost:\d+$/.test(origin)) {
+      reply.raw.setHeader('Access-Control-Allow-Origin', origin);
+    }
+    reply.raw.setHeader('Access-Control-Allow-Credentials', 'true');
     reply.raw.setHeader('Content-Type', 'text/event-stream');
     reply.raw.setHeader('Cache-Control', 'no-cache');
     reply.raw.setHeader('Connection', 'keep-alive');

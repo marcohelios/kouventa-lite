@@ -1,0 +1,7 @@
+deepagents
+langchain-ollama
+psycopg2-binary
+ollama
+python-dotenv
+fastapi
+uvicorn

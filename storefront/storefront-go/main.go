@@ -11,6 +11,8 @@ import (
 
 	"storefront-go/database"
 	"storefront-go/models"
+	"storefront-go/routes"
+	"storefront-go/crypto"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
@@ -52,24 +54,17 @@ func main() {
 	database.ConnectDB()
 	ollamaURL:= os.Getenv("OLLAMA_URL")
 	if ollamaURL == "" {
-		ollamaURL = "http://localhost:11434"
+		ollamaURL = "http://host.docker.internal:11434"
 	}
 	app := fiber.New()
-	app.Use(cors.New())
+	app.Use(cors.New(cors.Config{
+		AllowOrigins: "http://localhost:3000, http://localhost:3003",
+		AllowMethods: "POST, GET, OPTIONS, PUT, DELETE",
+		AllowCredentials: true,
+		AllowHeaders: "Content-Type, Authorization",
+	}))
 
-	// ==========================================
-	// GET: Fetch all products
-	// ==========================================
-	app.Get("/api/products", func(c *fiber.Ctx) error {
-		var products []models.Product
-		
-		result := database.DB.Select("id", "name", "description", "price", "category").Order("name ASC").Find(&products)
-		if result.Error != nil {
-			return c.Status(500).JSON(fiber.Map{"error": "Failed to fetch products"})
-		}
-
-		return c.JSON(products)
-	})
+	routes.RegisterAuthRoutes(app, database.DB) 
 
 	// ==========================================
 	// POST: Semantic Vector Search
@@ -178,6 +173,10 @@ func main() {
     })
 })
 
+	// app.Post("/api/products", func(c *fiber.Ctx) error {
+    // return c.Status(500).JSON(fiber.Map{"error": "Simulated crash"})
+	// })
+
 	// ==========================================
 	// POST: RAG Chat Streaming Endpoint
 	// ==========================================
@@ -274,28 +273,43 @@ Context:
 		return nil
 	})
 
+	// ERROR BY ONE API TEST
+	// app.Post("/api/chat", func(c *fiber.Ctx) error {
+    // return c.Status(500).JSON(fiber.Map{"error": "Simulated crash"})
+	// })
+
 	// ==========================================
 	// DELETE: Remove a product by ID
 	// ==========================================
 	app.Delete("/api/products/:id", func(c *fiber.Ctx) error {
-		productId := c.Params("id")
+		authHeader := c.Get("Authorization")
+		if len(authHeader) < 8 {
+			return c.Status(400).JSON(fiber.Map{"error": "Missing encryption key"})
+		}
+		aesKey, err := crypto.UnwrapKey(authHeader[7:])
+		if err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid encryption key"})
+		}
 
-		// Tell GORM to delete the Product where ID matches the URL parameter
+		encryptedId := c.Params("id")
+		productId, err := crypto.DecryptValue(aesKey, encryptedId)
+		if err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid encrypted param"})
+		}
+
 		result := database.DB.Delete(&models.Product{}, "id = ?", productId)
-
 		if result.Error != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Failed to delete product"})
 		}
 
-		if result.RowsAffected == 0 {
-			return c.Status(404).JSON(fiber.Map{"error": "Product not found"})
-		}
-
-		return c.JSON(fiber.Map{
-			"success": true,
-			"message": "Deleted product ID: " + productId,
-		})
+		responseBody, _ := json.Marshal(fiber.Map{"success": true, "message": "Deleted product " + productId})
+		encrypted, _ := crypto.EncryptValue(aesKey, string(responseBody))
+		return c.SendString(encrypted)
 	})
+
+	// app.Delete("/api/products/:id", func(c *fiber.Ctx) error {
+    // return c.Status(500).JSON(fiber.Map{"error": "Simulated crash"})
+	// })
 
 	app.Listen(":3001")
 }
