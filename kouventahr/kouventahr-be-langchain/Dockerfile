@@ -4,7 +4,9 @@ WORKDIR /app
 
 # Install deps first (better layer caching)
 COPY package.json package-lock.json ./
-RUN npm ci
+# --legacy-peer-deps: @langchain/community declares @browserbasehq/stagehand as a peer, which wants
+# zod@3 while this project uses zod@4. Newer npm tolerates it; the npm in node:20 does not.
+RUN npm ci --legacy-peer-deps
 
 COPY . .
 

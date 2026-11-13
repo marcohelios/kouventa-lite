@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "./mcp-sandbox"],
+      "allowedTools": ["read_file", "list_directory", "search_files"]
+    },
+    "neo4j": {
+      "url": "${NEO4J_MCP_URL}",
+      "transport": "http",
+      "headers": {
+        "X-Neo4j-MCP-URI": "${TENANT_NEO4J_URI}",
+        "Authorization": "Basic ${TENANT_NEO4J_BASIC_AUTH}"
+      },
+      "allowedTools": ["get-schema", "read-cypher"],
+      "timeoutMs": 20000,
+      "maxResultChars": 8000,
+      "instructions": "You can query the knowledge graph built from the uploaded documents with get-schema and read-cypher (read-only). You may query repeatedly: look, then refine, then expand, and use each result to write the next query.\n\nGraph conventions:\n- Every uploaded document is its own graph. Entity nodes, chunk nodes and relationships carry `graphId`, which is the document's id (document ids come from list_documents). Nothing is shared between documents: the same name in two documents is two separate nodes, one per graphId.\n- Entities have the label __Entity__ plus a type label (e.g. Regulation, Organization, Obligation, Process). The entity's name is in the property `id`.\n- Facts are relationships between __Entity__ nodes of the same graph. Document nodes hold raw chunk text and are linked to entities by MENTIONS; use them only to fetch source passages (return d.text with a small LIMIT).\n- For a question about one document, always scope to it: add {graphId: '<document id>'} to the node pattern, or WHERE n.graphId = '<document id>'.\n- Find entities by name with the full-text index, not an exact match: CALL db.index.fulltext.queryNodes('entity', 'sanksi~2') YIELD node, score RETURN node.id, node.graphId, labels(node), score LIMIT 10. It returns one row per document that has the name, so add WHERE node.graphId = '<document id>' to stay in one document.\n- To expand from a found entity: MATCH (n:__Entity__ {graphId: '<document id>', id: '<name>'})-[r]-(m:__Entity__) RETURN n.id, type(r), m.id LIMIT 50\n- To look across documents, group instead of listing every copy: e.g. MATCH (n:__Entity__) WHERE n.id CONTAINS 'sanksi' RETURN n.id, count(DISTINCT n.graphId) AS documents LIMIT 20\n\nRules:\n- Always add a LIMIT (50 or less) and bound variable-length paths, e.g. [*1..3].\n- If a query returns nothing, try a looser name (fuzzy ~2, a shorter term, another language such as Indonesian) before giving up.\n- Use at most about 10 graph queries per question. If the answer is still not found, answer with what you have and say what is missing.\n- Entity names and relationships are not statutory text. For legal wording, citations and article numbers, use search_documents."
+    }
+  }
+}

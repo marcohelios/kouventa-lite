@@ -1,12 +1,23 @@
 import Fastify, { FastifyRequest, FastifyReply } from 'fastify';
 import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
-import { config } from './config';
+import { config } from './config/config';
 import * as db from './db';
-import { initVectorStore, getRetriever, deleteChunks } from './vectorstore';
-import { splitPdf, ingest, formatContext, chain } from './rag';
+import { initVectorStore, deleteChunks } from './vectorstore';
+import { hybridRetrieve } from './hybridRetriever';
+import { closeGraph, getGraph } from './graph/neo4j';
+import { removeDocumentGraph } from './graph/store';
+import { graphRoutes } from './graphRoutes';
+import { splitPdf, ingest, chain } from './rag';
+import { startSse } from './sse';
+import { agentRoutes } from './agent/agentRoutes';
+import { closeAgent, initAgent } from './agent/agent';
+import { registerTenantAuth } from './tenant/auth';
 
 const app = Fastify({ logger: true });
+registerTenantAuth(app);
+app.addHook('onClose', closeGraph);
+app.addHook('onClose', closeAgent);
 
 interface ChatBody {
   message: string;
@@ -32,9 +43,10 @@ app.post('/api/upload', async (request: FastifyRequest, reply: FastifyReply) => 
 
     const chunks = await splitPdf(fileBuffer);
 
-    documentId = await db.createDocument(filename);
-    const chunksCreated = await ingest(documentId, filename, chunks);
-    await db.setChunkCount(documentId, chunksCreated);
+    documentId = await db.createDocument(request.tenant.id, filename);
+    await db.seedNodeTypes(request.tenant.id, documentId); // starter types for this document's graph
+    const chunksCreated = await ingest(request.tenant.id, documentId, filename, chunks);
+    await db.setChunkCount(request.tenant.id, documentId, chunksCreated);
 
     return reply.status(200).send({
       success: true,
@@ -47,8 +59,8 @@ app.post('/api/upload', async (request: FastifyRequest, reply: FastifyReply) => 
     // Roll back a half-ingested document so it doesn't show up in the list.
     if (documentId) {
       try {
-        await deleteChunks(documentId);
-        await db.deleteDocument(documentId);
+        await deleteChunks(request.tenant.id, documentId);
+        await db.deleteDocument(request.tenant.id, documentId);
       } catch (cleanupError) {
         app.log.error(cleanupError, 'Rollback after failed upload also failed');
       }
@@ -58,9 +70,9 @@ app.post('/api/upload', async (request: FastifyRequest, reply: FastifyReply) => 
 });
 
 // --- LIST UPLOADED DOCUMENTS ---
-app.get('/api/documents', async (_request: FastifyRequest, reply: FastifyReply) => {
+app.get('/api/documents', async (request: FastifyRequest, reply: FastifyReply) => {
   try {
-    return reply.status(200).send(await db.listDocuments());
+    return reply.status(200).send(await db.listDocuments(request.tenant.id));
   } catch (error) {
     app.log.error(error, 'Error fetching documents');
     return reply.status(500).send({ error: 'Failed to fetch documents' });
@@ -76,32 +88,35 @@ app.post('/api/chat', async (request: FastifyRequest<{ Body: ChatBody }>, reply:
       return reply.status(400).send({ error: 'Message is required' });
     }
 
-    // 1. Retrieve: standard LangChain vector-store retriever (top-k similarity)
-    const retriever = getRetriever(documentId);
-    const relevantDocs = await retriever.invoke(message);
+    // 1. Retrieve: pgvector top-k chunks + knowledge-graph facts (graph is best-effort)
+    const { docs: relevantDocs, context, graphUsed, graphFacts, graphChunks, duplicateChunks, vectorMs, graphMs } =
+      await hybridRetrieve(request.tenant, message, documentId);
+    request.log.info(
+      {
+        graphUsed,
+        graphFacts: graphFacts.length,
+        totalChunks: relevantDocs.length,
+        graphChunks,
+        duplicateChunks,
+        vectorMs,
+        graphMs,
+      },
+      'Hybrid retrieval'
+    );
+    if (graphFacts.length > 0) request.log.debug({ graphFacts }, 'Graph facts');
 
     // 2. Chat session & history
     let currentSessionId = sessionId;
     let history: db.HistoryMessage[] = [];
 
-    if (!currentSessionId || !(await db.sessionExists(currentSessionId))) {
-      currentSessionId = await db.createSession();
+    if (!currentSessionId || !(await db.sessionExists(request.tenant.id, currentSessionId))) {
+      currentSessionId = await db.createSession(request.tenant.id);
     } else {
-      history = await db.getHistory(currentSessionId, 6);
+      history = await db.getHistory(request.tenant.id, currentSessionId, 6);
     }
 
     // 3. Take over the raw response for Server-Sent Events
-    reply.hijack();
-
-    for (const [key, value] of Object.entries(reply.getHeaders())) {
-      if (value !== undefined) reply.raw.setHeader(key, value);
-    }
-
-    reply.raw.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      Connection: 'keep-alive',
-    });
+    startSse(reply);
 
     const sources = relevantDocs.map((d) => ({
       documentId: d.metadata.documentId,
@@ -109,12 +124,17 @@ app.post('/api/chat', async (request: FastifyRequest<{ Body: ChatBody }>, reply:
     }));
 
     reply.raw.write(
-      `data: ${JSON.stringify({ type: 'meta', sessionId: currentSessionId, sources })}\n\n`
+      `data: ${JSON.stringify({
+        type: 'meta',
+        sessionId: currentSessionId,
+        sources,
+        graph: { used: graphUsed, facts: graphFacts.length },
+      })}\n\n`
     );
 
     // 4. Generate: stream tokens from the local LLM
     const stream = await chain.stream({
-      context: formatContext(relevantDocs) || 'No matching document context found.',
+      context: context || 'No matching document context found.',
       history: history.map((m) => [m.role, m.content] as [string, string]),
       question: message,
     });
@@ -126,7 +146,7 @@ app.post('/api/chat', async (request: FastifyRequest<{ Body: ChatBody }>, reply:
     }
 
     // 5. Persist the exchange
-    await db.saveMessages(currentSessionId, message, fullAiResponse);
+    await db.saveMessages(request.tenant.id, currentSessionId, message, fullAiResponse);
 
     reply.raw.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
     return reply.raw.end();
@@ -145,12 +165,18 @@ app.delete('/api/documents/:id', async (request: FastifyRequest<{ Params: { id: 
   try {
     const id = request.params.id;
 
-    if (!db.isUuid(id) || (await db.deleteDocument(id)) === 0) {
+    if (!db.isUuid(id) || (await db.deleteDocument(request.tenant.id, id)) === 0) {
       return reply.status(404).send({ error: 'Document not found' });
     }
-    await deleteChunks(id);
+    await deleteChunks(request.tenant.id, id);
+    // The graph is optional enrichment: a Neo4j outage must not block deleting a document.
+    try {
+      await removeDocumentGraph(await getGraph(request.tenant), id);
+    } catch (graphError) {
+      app.log.error(graphError, 'Could not remove the deleted document from the knowledge graph');
+    }
 
-    return reply.status(200).send({ success: true, message: 'Document and associated vectors deleted.' });
+    return reply.status(200).send({ success: true, message: 'Document, vectors and graph data deleted.' });
   } catch (error) {
     app.log.error(error, 'Error deleting document');
     return reply.status(500).send({ error: 'Failed to delete document' });
@@ -160,9 +186,14 @@ app.delete('/api/documents/:id', async (request: FastifyRequest<{ Params: { id: 
 // --- START SERVER ---
 const startServer = async () => {
   try {
-    await app.register(cors, {});
+    // The default method list is GET/HEAD/POST only, which blocks the browser's PATCH/DELETE preflight.
+    await app.register(cors, { methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'] });
     await app.register(multipart);
+    await app.register(graphRoutes);
+    await app.register(agentRoutes);
+    await db.migrate();
     await initVectorStore();
+    await initAgent();
     const address = await app.listen({ port: config.port, host: '0.0.0.0' });
     console.log(`Server listening at ${address}`);
   } catch (err) {

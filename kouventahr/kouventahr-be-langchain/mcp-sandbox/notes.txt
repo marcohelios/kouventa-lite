@@ -1,0 +1,3 @@
+Sample file for the MCP filesystem server demo.
+
+Topics to look into in the uploaded documents: bank sanctions, licence revocation, reporting obligations.

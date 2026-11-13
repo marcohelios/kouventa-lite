@@ -1,3 +1,34 @@
+# Multi-tenant layout: every tenant has its OWN Neo4j Community container and data volume, so graphs are
+# physically isolated. Postgres, Ollama and the app are shared (Postgres rows are scoped by tenant_id).
+#
+# Adding a tenant:
+#   1. copy a `tenant-<slug>-neo4j` service below (new service name, volume, and host ports)
+#   2. add TENANT_<SLUG>_NEO4J_PASSWORD to .env, and pass it to the `app` service below
+#   3. add the service name to NEO4J_MCP_HTTP_ALLOWED_URIS on `neo4j-mcp`
+#   4. docker compose up -d, then: docker compose exec app npm run tenant:add -- <slug>
+
+# Settings every tenant Neo4j container shares. (Merged into each service's `environment`.)
+x-neo4j-env: &neo4j-env
+  NEO4J_PLUGINS: '["apoc"]'
+  NEO4J_dbms_security_procedures_unrestricted: apoc.*
+  NEO4J_dbms_security_procedures_allowlist: apoc.*
+  # Each container is its own JVM: cap memory so a handful of tenants fit on one host.
+  NEO4J_server_memory_heap_initial__size: 512m
+  NEO4J_server_memory_heap_max__size: 512m
+  NEO4J_server_memory_pagecache_size: 256m
+
+x-neo4j-tenant: &neo4j-tenant
+  image: neo4j:5
+  restart: unless-stopped
+  mem_limit: 1g
+  healthcheck:
+    # NEO4J_AUTH is "neo4j/<password>"; the password is whatever follows the slash.
+    test: ["CMD-SHELL", "cypher-shell -u neo4j -p \"$${NEO4J_AUTH#neo4j/}\" 'RETURN 1' || exit 1"]
+    interval: 10s
+    timeout: 10s
+    retries: 12
+    start_period: 30s
+
 services:
   postgres:
     image: pgvector/pgvector:pg16
@@ -54,21 +85,57 @@ services:
       - ollama pull ${EMBED_MODEL:-nomic-embed-text} && ollama pull ${CHAT_MODEL:-llama3.1:8b}
     restart: "no"
 
-  # Knowledge graph for the GraphRAG comparison (src/graphrag/). Not used by the app.
-  # Browser UI: http://localhost:7474 (neo4j / password123)
-  neo4j:
-    image: neo4j:5.26-community
-    container_name: kouventahr-lc-neo4j
-    restart: unless-stopped
+  # ---- Tenants: one Neo4j Community container each. Host ports are bound to localhost (Neo4j Browser,
+  # ---- host-side scripts); the app reaches them over the compose network as bolt://<service>:7687.
+  tenant-a-neo4j:
+    <<: *neo4j-tenant
+    container_name: neo4j_tenant_a
     environment:
-      NEO4J_AUTH: neo4j/password123
-      NEO4J_PLUGINS: '["apoc"]'
-      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+      <<: *neo4j-env
+      NEO4J_AUTH: neo4j/${TENANT_A_NEO4J_PASSWORD:?set TENANT_A_NEO4J_PASSWORD in .env}
     ports:
-      - "7474:7474"
-      - "7687:7687"
+      - "127.0.0.1:7474:7474"   # HTTP browser
+      - "127.0.0.1:7687:7687"   # Bolt
     volumes:
-      - kouventahr_lc_neo4j:/data
+      - tenant_a_neo4j:/data
+
+  tenant-b-neo4j:
+    <<: *neo4j-tenant
+    container_name: neo4j_tenant_b
+    environment:
+      <<: *neo4j-env
+      NEO4J_AUTH: neo4j/${TENANT_B_NEO4J_PASSWORD:?set TENANT_B_NEO4J_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:7475:7474"   # HTTP browser
+      - "127.0.0.1:7688:7687"   # Bolt
+    volumes:
+      - tenant_b_neo4j:/data
+
+  # Official Neo4j MCP server, so the agent can run its own (read-only) Cypher against the graph.
+  # In HTTP mode it holds no connection of its own: each request names the Neo4j URI (X-Neo4j-MCP-URI)
+  # and carries the credentials (Authorization). The app sets both per tenant (see mcp.json), so the
+  # model can never choose which tenant's database it reaches.
+  neo4j-mcp:
+    image: neo4j/mcp
+    container_name: kouventahr-lc-neo4j-mcp
+    restart: unless-stopped
+    depends_on:
+      tenant-a-neo4j:
+        condition: service_healthy
+      tenant-b-neo4j:
+        condition: service_healthy
+    environment:
+      NEO4J_MCP_TRANSPORT_MODE: http
+      NEO4J_MCP_HTTP_HOST: 0.0.0.0
+      NEO4J_MCP_HTTP_PORT: "8787"
+      # One entry per tenant Neo4j service. NOTE: the exact value format is unverified (the previous
+      # single-tenant value was the bare host "neo4j"); if tenant agents report the neo4j tools as
+      # unavailable, check this against the neo4j/mcp release you run.
+      NEO4J_MCP_HTTP_ALLOWED_URIS: tenant-a-neo4j,tenant-b-neo4j
+      NEO4J_MCP_READ_ONLY: "true"
+      NEO4J_MCP_TELEMETRY: "false"
+    ports:
+      - "127.0.0.1:8787:8787"
 
   app:
     build: .
@@ -77,6 +144,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      tenant-a-neo4j:
+        condition: service_healthy
+      tenant-b-neo4j:
+        condition: service_healthy
+      neo4j-mcp:
+        condition: service_started
       ollama-pull:
         condition: service_completed_successfully
     environment:
@@ -87,10 +160,31 @@ services:
       RETRIEVER_K: ${RETRIEVER_K:-5}
       CHUNK_SIZE: ${CHUNK_SIZE:-2000}
       CHUNK_OVERLAP: ${CHUNK_OVERLAP:-200}
+      # Knowledge graph + Azure OpenAI entity extraction. Neo4j connections are per tenant (tenants table);
+      # a tenant row only names the env var that holds its Neo4j password, so each one is passed in here.
+      TENANT_A_NEO4J_PASSWORD: ${TENANT_A_NEO4J_PASSWORD}
+      TENANT_B_NEO4J_PASSWORD: ${TENANT_B_NEO4J_PASSWORD}
+      GRAPH_TIMEOUT_MS: ${GRAPH_TIMEOUT_MS:-8000}
+      GRAPH_BUILD_CONCURRENCY: ${GRAPH_BUILD_CONCURRENCY:-3}
+      GRAPH_ENTITY_TYPES: ${GRAPH_ENTITY_TYPES:-Regulation, Organization, Obligation, Process}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+      AZURE_OPENAI_API_INSTANCE_NAME: ${AZURE_OPENAI_API_INSTANCE_NAME:-}
+      AZURE_OPENAI_API_DEPLOYMENT_NAME: ${AZURE_OPENAI_API_DEPLOYMENT_NAME:-}
+      AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-${OPENAI_API_VERSION:-}}
+      OPENAI_API_VERSION: ${OPENAI_API_VERSION:-}
+      OPENAI_CHAT_MODEL: ${OPENAI_CHAT_MODEL:-}
+      # Agent (deepagents + MCP servers listed in mcp.json)
+      MCP_CONFIG_PATH: /app/mcp.json
+      NEO4J_MCP_URL: http://neo4j-mcp:8787/db/neo4j/mcp
+      AGENT_RECURSION_LIMIT: ${AGENT_RECURSION_LIMIT:-50}
+    volumes:
+      - ./mcp.json:/app/mcp.json:ro
+      - ./mcp-sandbox:/app/mcp-sandbox:ro
     ports:
       - "3001:3001"
 
 volumes:
   kouventahr_lc_pgdata:
   kouventahr_lc_ollama:
-  kouventahr_lc_neo4j:
+  tenant_a_neo4j:
+  tenant_b_neo4j:

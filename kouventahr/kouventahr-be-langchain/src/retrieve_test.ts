@@ -3,25 +3,33 @@
  * vector store returns. No LLM, no chat history.
  *
  *   npm run retrieve -- "apa itu bank"
- *   npm run retrieve -- "apa itu bank" --k 10 --doc <documentId> --text
+ *   npm run retrieve -- "apa itu bank" --tenant <tenantId> --k 10 --doc <documentId> --text
  *
  * Flags:
  *   --k <n>      number of chunks (default: RETRIEVER_K)
+ *   --tenant <id> tenant id (uuid from the tenants table); required
  *   --doc <id>   restrict to one document
  *   --text       print the full chunk text instead of a 120-char preview
  *
  * Score is cosine DISTANCE (0 = identical, lower = more similar).
  */
-import { config } from './config';
+import { config } from './config/config';
 import { initVectorStore, getVectorStore } from './vectorstore';
 
 function parseArgs(argv: string[]) {
-  const args = { query: '', k: config.retrieverK, doc: undefined as string | undefined, text: false };
+  const args = {
+    query: '',
+    k: config.retrieverK,
+    doc: undefined as string | undefined,
+    tenant: undefined as string | undefined,
+    text: false,
+  };
   const words: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--k') args.k = parseInt(argv[++i], 10);
     else if (a === '--doc') args.doc = argv[++i];
+    else if (a === '--tenant') args.tenant = argv[++i];
     else if (a === '--text') args.text = true;
     else words.push(a);
   }
@@ -30,9 +38,9 @@ function parseArgs(argv: string[]) {
 }
 
 async function main() {
-  const { query, k, doc, text } = parseArgs(process.argv.slice(2));
-  if (!query) {
-    console.error('Usage: npm run retrieve -- "your question" [--k 5] [--doc <documentId>] [--text]');
+  const { query, k, doc, tenant, text } = parseArgs(process.argv.slice(2));
+  if (!query || !tenant) {
+    console.error('Usage: npm run retrieve -- "your question" --tenant <tenantId> [--k 5] [--doc <documentId>] [--text]');
     process.exit(1);
   }
 
@@ -45,7 +53,7 @@ async function main() {
   const results = await getVectorStore().similaritySearchWithScore(
     query,
     k,
-    doc ? { documentId: doc } : undefined
+    doc ? { tenantId: tenant, documentId: doc } : { tenantId: tenant }
   );
   const ms = Date.now() - t0;
 
